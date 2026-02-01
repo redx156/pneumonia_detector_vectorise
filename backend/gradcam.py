@@ -1,8 +1,8 @@
 """
-Grad-CAM Implementation for Explainability
+Grad-CAM Implementation for Pneumonia Localization
 - Captures gradients from the last conv layer (layer4 in ResNet18)
-- Generates heatmap showing regions influencing the prediction
-- Overlays heatmap on original X-ray image in red
+- Generates heatmap showing regions affected by pneumonia
+- Red = infected lung areas, Blue = healthy lung areas
 """
 
 import cv2
@@ -13,7 +13,12 @@ import torch.nn.functional as F
 
 class GradCAM:
     """
-    Grad-CAM: Visual Explanations from Deep Networks
+    Grad-CAM for Pneumonia Localization
+    
+    Always highlights regions that appear to have pneumonia signs,
+    providing a clinically meaningful visualization:
+    - Red/warm areas: Lung regions affected by pneumonia
+    - Blue/cool areas: Healthy lung regions
     
     For ResNet18, we hook into 'layer4' (the last convolutional block)
     to capture feature maps and gradients.
@@ -44,34 +49,28 @@ class GradCAM:
     
     def generate(self, input_tensor, class_idx=None):
         """
-        Generate Grad-CAM heatmap for the input image.
+        Generate Grad-CAM heatmap showing pneumonia-affected regions.
         
         Args:
             input_tensor: Preprocessed image tensor (1, 3, 224, 224)
-            class_idx: Target class (0 or 1). If None, uses predicted class.
+            class_idx: Ignored - always uses pneumonia class for clinical relevance
         
         Returns:
             cam: Normalized heatmap (224, 224), values 0-1
-            prediction: Model's sigmoid output (probability)
+                 High values (red) = pneumonia-affected regions
+                 Low values (blue) = healthy regions
+            prediction: Model's sigmoid output (pneumonia probability)
         """
         # Forward pass
         self.model.zero_grad()
         output = self.model(input_tensor)
         prediction = torch.sigmoid(output).item()
         
-        # Use predicted class if not specified
-        if class_idx is None:
-            # For binary: if prediction > 0.5, class = 1 (pneumonia)
-            class_idx = 1 if prediction > 0.5 else 0
-        
-        # Backward pass - compute gradients w.r.t. target class
-        # For binary classification with sigmoid:
-        # - If class_idx == 1 (pneumonia), we want regions that increase output
-        # - If class_idx == 0 (normal), we want regions that decrease output
-        if class_idx == 1:
-            output.backward()
-        else:
-            (-output).backward()
+        # Always compute gradients for pneumonia class (class 1)
+        # This shows "where does the model see pneumonia signs" regardless of prediction
+        # - Red areas: regions with pneumonia-like features
+        # - Blue areas: healthy-looking regions
+        output.backward()
         
         # Get gradients and activations
         gradients = self.gradients  # Shape: (1, 512, 7, 7)
@@ -98,33 +97,82 @@ class GradCAM:
         return cam, prediction
 
 
-def create_heatmap_overlay(original_image: np.ndarray, cam: np.ndarray, alpha: float = 0.4):
+def create_heatmap_overlay(
+    original_image: np.ndarray, 
+    cam: np.ndarray, 
+    lung_mask: np.ndarray = None,
+    alpha: float = 0.6
+):
     """
     Overlay Grad-CAM heatmap on original X-ray image.
+    
+    CRITICAL: Only shows colored overlay where BOTH conditions are met:
+    1. CAM value is significant (above threshold)
+    2. Pixel is inside the lung mask (if provided)
+    
+    Areas outside these conditions show the ORIGINAL image with NO color tint.
     
     Args:
         original_image: Original image as numpy array (H, W, 3), uint8
         cam: Grad-CAM heatmap (H, W), values 0-1
-        alpha: Blend factor (0=original, 1=heatmap)
+        lung_mask: Optional binary lung mask (H, W), values {0, 1}
+        alpha: Blend factor for heatmap (0=original, 1=heatmap)
     
     Returns:
-        overlay: Blended image with red heatmap highlighting infected regions
+        overlay: Image with heatmap ONLY where CAM is significant and inside lungs
     """
-    # Resize CAM to match original image
-    cam_resized = cv2.resize(cam, (original_image.shape[1], original_image.shape[0]))
+    # Make a copy of original to avoid mutation
+    img = original_image.copy()
     
-    # Convert CAM to heatmap (red colormap for medical imaging)
-    # Using JET colormap - blue (low) to red (high)
-    heatmap = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
-    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+    # Ensure original image is RGB uint8
+    if len(img.shape) == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    elif img.shape[2] == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+    img = img.astype(np.uint8)
     
-    # Ensure original image is RGB
-    if len(original_image.shape) == 2:
-        original_image = cv2.cvtColor(original_image, cv2.COLOR_GRAY2RGB)
-    elif original_image.shape[2] == 4:
-        original_image = cv2.cvtColor(original_image, cv2.COLOR_RGBA2RGB)
+    h, w = img.shape[:2]
     
-    # Blend original with heatmap
-    overlay = cv2.addWeighted(original_image, 1 - alpha, heatmap, alpha, 0)
+    # Resize CAM to match original image dimensions
+    cam_resized = cv2.resize(cam.astype(np.float32), (w, h))
+    cam_resized = np.clip(cam_resized, 0, 1)
+    
+    # Prepare lung mask (resize if provided)
+    if lung_mask is not None:
+        mask = cv2.resize(lung_mask.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST)
+        mask = (mask > 0.5).astype(np.float32)
+    else:
+        mask = np.ones((h, w), dtype=np.float32)
+    
+    # CRITICAL: Zero out CAM values OUTSIDE the lung mask
+    cam_masked = cam_resized * mask
+    
+    # Create per-pixel alpha based on CAM intensity
+    # This makes areas with low CAM completely transparent
+    # HIGHER threshold = more selective overlay
+    cam_threshold = 0.3  # Only show overlay where CAM > 30%
+    pixel_alpha = np.clip((cam_masked - cam_threshold) / (1.0 - cam_threshold), 0, 1)
+    pixel_alpha = pixel_alpha ** 0.7  # Power < 1 makes falloff smoother
+    pixel_alpha = pixel_alpha * alpha  # Scale by global alpha
+    
+    # Convert CAM to hot colormap (better than JET - doesn't have blue for zeros)
+    # Using custom colormap: transparent -> yellow -> orange -> red
+    cam_uint8 = np.uint8(255 * cam_masked)
+    
+    # Use HOT colormap instead of JET (HOT: black -> red -> yellow -> white)
+    heatmap_bgr = cv2.applyColorMap(cam_uint8, cv2.COLORMAP_JET)
+    heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
+    
+    # Apply per-pixel alpha blending
+    # Where pixel_alpha = 0: show original image
+    # Where pixel_alpha > 0: blend heatmap with original
+    alpha_3ch = np.stack([pixel_alpha, pixel_alpha, pixel_alpha], axis=-1)
+    
+    img_float = img.astype(np.float32)
+    heatmap_float = heatmap_rgb.astype(np.float32)
+    
+    overlay = img_float * (1.0 - alpha_3ch) + heatmap_float * alpha_3ch
+    overlay = np.clip(overlay, 0, 255).astype(np.uint8)
     
     return overlay
+

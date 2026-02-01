@@ -7,6 +7,7 @@ from .models import get_model, get_gradcam
 from .gradcam import create_heatmap_overlay
 from .utils import preprocess_image, numpy_to_base64, base64_to_data_uri, check_image_quality
 from .schemas import PredictionResponse, HealthResponse
+from .lung_segmentation import segment_lungs, validate_lung_mask
 
 
 router = APIRouter()
@@ -70,8 +71,13 @@ async def predict(file: UploadFile = File(...)):
         is_pneumonia = raw_confidence >= DECISION_THRESHOLD
         prediction = "Pneumonia" if is_pneumonia else "Normal"
         
-        # Create heatmap overlay on original image
-        overlay = create_heatmap_overlay(original_image, cam, alpha=0.4)
+        # Run lung segmentation to constrain heatmap to lung regions
+        lung_mask = segment_lungs(original_image)
+        mask_validation = validate_lung_mask(lung_mask)
+        
+        # Create heatmap overlay WITH lung mask
+        # Colors only appear where CAM is significant AND inside lungs
+        overlay = create_heatmap_overlay(original_image, cam, lung_mask=lung_mask, alpha=0.6)
         
         # Convert to base64 for API response
         heatmap_base64 = numpy_to_base64(overlay)
@@ -81,7 +87,7 @@ async def predict(file: UploadFile = File(...)):
         if is_pneumonia:
             note = (
                 f"AI detected potential pneumonia with {raw_confidence:.1%} confidence. "
-                f"Red/yellow regions in heatmap indicate areas of concern. "
+                f"Highlighted regions show model attention within lung boundaries. "
                 f"Please review for clinical confirmation."
             )
         else:
@@ -89,6 +95,10 @@ async def predict(file: UploadFile = File(...)):
                 f"No significant pneumonia indicators detected (confidence: {raw_confidence:.1%}). "
                 f"This is an AI screening - clinical judgment should prevail."
             )
+        
+        # Add lung segmentation warnings if any
+        for warning in mask_validation.get("warnings", []):
+            note += f" Segmentation warning: {warning}"
         
         # Append quality warning if applicable (informational only)
         if quality["warning"]:

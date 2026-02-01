@@ -1,1 +1,26 @@
-.envcheckpoints/
+# Virtual environment
+.venv/
+venv/
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Data files (too large for git)
+data/
+
+# Model checkpoints (too large for git)  
+checkpoints/
+
+# Node modules
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
